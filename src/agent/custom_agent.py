@@ -135,7 +135,7 @@ class CustomAgent(Agent):
             planner_llm=planner_llm,
             planner_interval=planner_interval
         )
-        if self.model_name in ["deepseek-reasoner"] or "deepseek-r1" in self.model_name:
+        if self.model_name in ["deepseek-reasoner"] or "deepseek-r1" in self.model_name or "deepseek-ai" in self.model_name:
             # deepseek-reasoner does not support function calling
             self.use_deepseek_r1 = True
             # deepseek-reasoner only support 64000 context
@@ -223,36 +223,74 @@ class CustomAgent(Agent):
     @time_execution_async("--get_next_action")
     async def get_next_action(self, input_messages: list[BaseMessage]) -> AgentOutput:
         """Get next action from LLM based on current state"""
-
         ai_message = self.llm.invoke(input_messages)
         self.message_manager._add_message_with_tokens(ai_message)
 
+        # Handle reasoning content if available
         if hasattr(ai_message, "reasoning_content"):
             logger.info("🤯 Start Deep Thinking: ")
             logger.info(ai_message.reasoning_content)
             logger.info("🤯 End Deep Thinking")
 
+        # Extract content safely
         if isinstance(ai_message.content, list):
-            ai_content = ai_message.content[0]
+            ai_content = ai_message.content[0].text if hasattr(ai_message.content[0], 'text') else str(ai_message.content[0])
         else:
             ai_content = ai_message.content
 
-        ai_content = ai_content.replace("```json", "").replace("```", "")
-        ai_content = repair_json(ai_content)
-        parsed_json = json.loads(ai_content)
-        parsed: AgentOutput = self.AgentOutput(**parsed_json)
+        # Flexible JSON extraction
+        json_part = ai_content.split("</think>")[-1].strip() if "</think>" in ai_content else ai_content.strip()
+        json_part = json_part.replace("```json", "").replace("```", "").strip()
+        logger.debug(f"Extracted JSON: {json_part}")
 
-        if parsed is None:
-            logger.debug(ai_message.content)
-            raise ValueError('Could not parse response.')
+        # Repair and parse JSON
+        try:
+            repaired_json = repair_json(json_part)
+            parsed_json = json.loads(repaired_json)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON: {e}")
+            logger.error(f"Original content: {ai_content}")
+            raise ValueError(f"Invalid JSON format: {json_part}")
 
-        # Limit actions to maximum allowed per step
-        parsed.action = parsed.action[: self.max_actions_per_step]
+        # Handle current_state with fallback
+        if "current_state" not in parsed_json:
+            parsed_json["current_state"] = {
+                "prev_action_evaluation": "Not evaluated",
+                "important_contents": "",
+                "task_progress": "",
+                "future_plans": "",
+                "thought": "",
+                "summary": ""
+            }
+
+        # Process actions
+        actions = parsed_json.get("action", [])
+        if not isinstance(actions, list):
+            actions = [actions]
+        
+        valid_actions = []
+        for action in actions:
+            if isinstance(action, dict):
+                valid_actions.append(action)
+            elif isinstance(action, str):
+                try:
+                    valid_actions.append(json.loads(action))
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid action format: {action}")
+        
+        parsed_json["action"] = valid_actions[:self.max_actions_per_step]
+
+        try:
+            parsed = self.AgentOutput(**parsed_json)
+        except TypeError as e:
+            logger.error(f"Validation error: {e}")
+            logger.error(f"Invalid structure: {parsed_json}")
+            raise ValueError("Failed to validate agent output")
+
         self._log_response(parsed)
         self.n_steps += 1
-
         return parsed
-
+    
     async def _run_planner(self) -> Optional[str]:
         """Run the planner to analyze state and suggest next steps"""
         # Skip planning if no planner_llm is set

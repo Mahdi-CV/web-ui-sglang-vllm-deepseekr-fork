@@ -198,13 +198,45 @@ Provide your output as a JSON formatted list. Each item in the list must adhere 
                 logger.info("🤯 Start Search Deep Thinking: ")
                 logger.info(ai_query_msg.reasoning_content)
                 logger.info("🤯 End Search Deep Thinking")
-            ai_query_content = ai_query_msg.content.replace("```json", "").replace("```", "")
-            ai_query_content = repair_json(ai_query_content)
-            ai_query_content = json.loads(ai_query_content)
-            query_plan = ai_query_content["plan"]
+            ###
+            # Modified JSON processing for search step
+            ai_content = ai_query_msg.content
+            
+            # Extract JSON content using same pattern as get_next_action
+            json_part = ai_content.split("</think>")[-1].strip() if "</think>" in ai_content else ai_content.strip()
+            json_part = json_part.replace("```json", "").replace("```", "").strip()
+            logger.debug(f"Extracted Search JSON: {json_part}")
+
+            # Repair and parse with validation
+            try:
+                repaired_json = repair_json(json_part)
+                parsed_search = json.loads(repaired_json)
+                
+                # Handle list responses and ensure dict structure
+                if isinstance(parsed_search, list):
+                    logger.warning("LLM returned a list for search plan, using first element")
+                    parsed_search = parsed_search[0] if parsed_search else {}
+                    
+                # Set defaults for missing fields
+                parsed_search.setdefault("plan", "No plan generated")
+                parsed_search.setdefault("queries", [])
+                
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.error(f"Failed to parse search JSON: {e}")
+                logger.error(f"Original content: {ai_content}")
+                parsed_search = {"plan": "Error in plan generation", "queries": []}
+
+
+            ###
+            # ai_query_content = ai_query_msg.content.replace("```json", "").replace("```", "")
+            # ai_query_content = repair_json(ai_query_content)
+            # ai_query_content = json.loads(ai_query_content)
+            # query_plan = ai_query_content["plan"]
+            query_plan = parsed_search["plan"]
             logger.info(f"Current Iteration {search_iteration} Planing:")
             logger.info(query_plan)
-            query_tasks = ai_query_content["queries"]
+            # query_tasks = ai_query_content["queries"]
+            query_tasks = parsed_search["queries"]
             if not query_tasks:
                 break
             else:
@@ -288,9 +320,46 @@ Provide your output as a JSON formatted list. Each item in the list must adhere 
                         logger.info(ai_record_msg.reasoning_content)
                         logger.info("🤯 End Record Deep Thinking")
                     record_content = ai_record_msg.content
-                    record_content = repair_json(record_content)
-                    new_record_infos = json.loads(record_content)
+                    # record_content = repair_json(record_content)
+                    # new_record_infos = json.loads(record_content)
+                    # history_infos.extend(new_record_infos)
+
+                    #Use same JSON extraction pattern
+                    json_part = record_content.split("</think>")[-1].strip() if "</think>" in record_content else record_content.strip()
+                    json_part = json_part.replace("```json", "").replace("```", "").strip()
+                    logger.debug(f"Extracted Record JSON: {json_part}")
+
+                    try:
+                        repaired_json = repair_json(json_part)
+                        parsed_records = json.loads(repaired_json)
+                        
+                        # Ensure we always get a list of records
+                        if isinstance(parsed_records, dict):
+                            parsed_records = [parsed_records]
+                        elif not isinstance(parsed_records, list):
+                            parsed_records = []
+                            
+                        # Validate each record entry
+                        valid_records = []
+                        required_keys = ["url", "title", "summary_content", "thinking"]
+                        
+                        for record in parsed_records:
+                            if isinstance(record, dict) and all(key in record for key in required_keys):
+                                # Clean string values
+                                cleaned = {k: str(v).strip() for k, v in record.items() if k in required_keys}
+                                valid_records.append(cleaned)
+                            else:
+                                logger.warning(f"Discarding invalid record entry: {record}")
+                                
+                        new_record_infos = valid_records
+                        
+                    except (json.JSONDecodeError, TypeError) as e:
+                        logger.error(f"Failed to parse record JSON: {e}")
+                        logger.error(f"Original content: {record_content}")
+                        new_record_infos = []
+
                     history_infos.extend(new_record_infos)
+
             if agent_state and agent_state.is_stop_requested():
                 # Stop
                 break
